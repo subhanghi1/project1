@@ -1,6 +1,6 @@
 -- Initialize state
-local balances = {}
 local properties = {}
+local shares = {}
 local transactions = {}
 
 -- Token configuration
@@ -8,110 +8,137 @@ local name = "Land Token"
 local ticker = "LAND"
 local denomination = 6
 
--- Property token management
+-- Create tables
+local sqlite3 = require('lsqlite3')
+local db = sqlite3.open_memory()
+
+db:exec[[
+  CREATE TABLE IF NOT EXISTS properties (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    location TEXT,
+    description TEXT,
+    price REAL,
+    total_shares INTEGER,
+    available_shares INTEGER,
+    image_url TEXT,
+    owner TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS shares (
+    id TEXT PRIMARY KEY,
+    property_id TEXT,
+    owner TEXT,
+    quantity INTEGER,
+    purchase_date TEXT,
+    FOREIGN KEY(property_id) REFERENCES properties(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    property_id TEXT,
+    buyer TEXT,
+    seller TEXT,
+    quantity INTEGER,
+    price_per_share REAL,
+    timestamp TEXT,
+    FOREIGN KEY(property_id) REFERENCES properties(id)
+  );
+]]
+
+-- List property
 Handlers.add(
-  "create-property-token",
-  { Action = "CreatePropertyToken" },
+  "list-property",
+  { Action = "ListProperty" },
   function(msg)
-    assert(type(msg.Tags.property_id) == 'string', 'Property ID required')
-    assert(type(msg.Tags.total_shares) == 'string', 'Total shares required')
-    assert(type(msg.Tags.price_per_share) == 'string', 'Price per share required')
+    local stmt = db:prepare[[
+      INSERT INTO properties 
+      (id, name, location, description, price, total_shares, available_shares, image_url, owner)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ]]
     
-    local property = {
-      id = msg.Tags.property_id,
-      owner = msg.From,
-      total_shares = tonumber(msg.Tags.total_shares),
-      price_per_share = tonumber(msg.Tags.price_per_share),
-      available_shares = tonumber(msg.Tags.total_shares),
-      details = {
-        location = msg.Tags.location,
-        area = msg.Tags.area,
-        description = msg.Tags.description
-      }
-    }
+    stmt:bind_values(
+      msg.Tags.id,
+      msg.Tags.name,
+      msg.Tags.location,
+      msg.Tags.description,
+      tonumber(msg.Tags.price),
+      tonumber(msg.Tags.total_shares),
+      tonumber(msg.Tags.total_shares),
+      msg.Tags.image_url,
+      msg.From
+    )
     
-    properties[property.id] = property
-    balances[property.id] = {}
-    balances[property.id][msg.From] = property.total_shares
+    stmt:step()
+    stmt:finalize()
     
     msg.reply({
-      Data = "Property token created successfully",
-      Tags = {
-        Status = "Success",
-        PropertyId = property.id
-      }
+      Data = "Property listed successfully",
+      Tags = { Status = "Success" }
     })
   end
 )
 
--- Buy property shares
+-- Purchase shares
 Handlers.add(
-  "buy-shares",
-  { Action = "BuyShares" },
+  "purchase-shares",
+  { Action = "PurchaseShares" },
   function(msg)
-    local property_id = msg.Tags.property_id
-    local quantity = tonumber(msg.Tags.quantity)
-    local property = properties[property_id]
+    local property_id = msg.Tags.PropertyId
+    local quantity = tonumber(msg.Tags.Quantity)
     
-    assert(property, 'Property not found')
-    assert(quantity <= property.available_shares, 'Insufficient shares available')
+    -- Get property details
+    local stmt = db:prepare"SELECT available_shares, price FROM properties WHERE id = ?"
+    stmt:bind_values(property_id)
+    local row = stmt:first_row()
     
-    -- Calculate cost
-    local total_cost = quantity * property.price_per_share
-    
-    -- Update balances
-    if not balances[property_id][msg.From] then
-      balances[property_id][msg.From] = 0
+    if not row or row[1] < quantity then
+      msg.reply({
+        Data = "Insufficient shares available",
+        Tags = { Status = "Error" }
+      })
+      return
     end
     
-    balances[property_id][msg.From] = balances[property_id][msg.From] + quantity
-    property.available_shares = property.available_shares - quantity
+    -- Update available shares
+    stmt = db:prepare"UPDATE properties SET available_shares = available_shares - ? WHERE id = ?"
+    stmt:bind_values(quantity, property_id)
+    stmt:step()
+    
+    -- Record share purchase
+    local share_id = ao.id .. "-" .. os.time()
+    stmt = db:prepare[[
+      INSERT INTO shares (id, property_id, owner, quantity, purchase_date)
+      VALUES (?, ?, ?, ?, ?)
+    ]]
+    stmt:bind_values(share_id, property_id, msg.From, quantity, os.date())
+    stmt:step()
     
     -- Record transaction
-    local tx = {
-      id = ao.id .. '-' .. os.time(),
-      property_id = property_id,
-      buyer = msg.From,
-      quantity = quantity,
-      price_per_share = property.price_per_share,
-      total_cost = total_cost,
-      timestamp = os.time()
-    }
-    table.insert(transactions, tx)
+    local tx_id = ao.id .. "-tx-" .. os.time()
+    stmt = db:prepare[[
+      INSERT INTO transactions 
+      (id, property_id, buyer, seller, quantity, price_per_share, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    ]]
+    stmt:bind_values(
+      tx_id,
+      property_id,
+      msg.From,
+      nil,
+      quantity,
+      row[2],
+      os.date()
+    )
+    stmt:step()
     
     msg.reply({
       Data = "Shares purchased successfully",
-      Tags = {
+      Tags = { 
         Status = "Success",
-        TransactionId = tx.id
+        ShareId = share_id,
+        TransactionId = tx_id
       }
-    })
-  end
-)
-
--- Transfer shares
-Handlers.add(
-  "transfer-shares",
-  { Action = "TransferShares" },
-  function(msg)
-    local property_id = msg.Tags.property_id
-    local to = msg.Tags.to
-    local quantity = tonumber(msg.Tags.quantity)
-    
-    assert(balances[property_id], 'Property not found')
-    assert(balances[property_id][msg.From] >= quantity, 'Insufficient shares')
-    
-    -- Update balances
-    if not balances[property_id][to] then
-      balances[property_id][to] = 0
-    end
-    
-    balances[property_id][msg.From] = balances[property_id][msg.From] - quantity
-    balances[property_id][to] = balances[property_id][to] + quantity
-    
-    msg.reply({
-      Data = "Shares transferred successfully",
-      Tags = { Status = "Success" }
     })
   end
 )
@@ -121,11 +148,23 @@ Handlers.add(
   "get-property",
   { Action = "GetProperty" },
   function(msg)
-    local property = properties[msg.Tags.property_id]
+    local stmt = db:prepare"SELECT * FROM properties WHERE id = ?"
+    stmt:bind_values(msg.Tags.PropertyId)
+    local row = stmt:first_row()
     
-    if property then
+    if row then
       msg.reply({
-        Data = json.encode(property),
+        Data = json.encode({
+          id = row[1],
+          name = row[2],
+          location = row[3],
+          description = row[4],
+          price = row[5],
+          total_shares = row[6],
+          available_shares = row[7],
+          image_url = row[8],
+          owner = row[9]
+        }),
         Tags = { Status = "Success" }
       })
     else
@@ -137,62 +176,65 @@ Handlers.add(
   end
 )
 
--- Get user's shares
+-- Get all properties
 Handlers.add(
-  "get-user-shares",
-  { Action = "GetUserShares" },
+  "get-properties",
+  { Action = "GetProperties" },
   function(msg)
-    local user_shares = {}
+    local properties = {}
+    local stmt = db:prepare"SELECT * FROM properties"
     
-    for property_id, property_balances in pairs(balances) do
-      if property_balances[msg.From] and property_balances[msg.From] > 0 then
-        table.insert(user_shares, {
-          property_id = property_id,
-          shares = property_balances[msg.From],
-          property_details = properties[property_id]
-        })
-      end
+    for row in stmt:nrows() do
+      table.insert(properties, {
+        id = row.id,
+        name = row.name,
+        location = row.location,
+        description = row.description,
+        price = row.price,
+        total_shares = row.total_shares,
+        available_shares = row.available_shares,
+        image_url = row.image_url,
+        owner = row.owner
+      })
     end
     
     msg.reply({
-      Data = json.encode(user_shares),
+      Data = json.encode(properties),
       Tags = { Status = "Success" }
     })
   end
 )
 
--- Distribute dividends
+-- Get user's shares
 Handlers.add(
-  "distribute-dividends",
-  { Action = "DistributeDividends" },
+  "get-user-shares",
+  { Action = "GetUserShares" },
   function(msg)
-    local property_id = msg.Tags.property_id
-    local amount = tonumber(msg.Tags.amount)
-    local property = properties[property_id]
+    local shares = {}
+    local stmt = db:prepare[[
+      SELECT s.*, p.* FROM shares s
+      JOIN properties p ON s.property_id = p.id
+      WHERE s.owner = ?
+    ]]
+    stmt:bind_values(msg.From)
     
-    assert(property, 'Property not found')
-    assert(msg.From == property.owner, 'Only property owner can distribute dividends')
-    
-    -- Calculate total shares
-    local total_shares = property.total_shares
-    
-    -- Distribute to shareholders
-    for holder, shares in pairs(balances[property_id]) do
-      if shares > 0 then
-        local dividend = (shares / total_shares) * amount
-        ao.send({
-          Target = holder,
-          Tags = {
-            Action = "DividendPayment",
-            Amount = tostring(dividend),
-            PropertyId = property_id
-          }
-        })
-      end
+    for row in stmt:nrows() do
+      table.insert(shares, {
+        share_id = row.id,
+        property_id = row.property_id,
+        quantity = row.quantity,
+        purchase_date = row.purchase_date,
+        property = {
+          name = row.name,
+          location = row.location,
+          price = row.price,
+          total_shares = row.total_shares
+        }
+      })
     end
     
     msg.reply({
-      Data = "Dividends distributed successfully",
+      Data = json.encode(shares),
       Tags = { Status = "Success" }
     })
   end
